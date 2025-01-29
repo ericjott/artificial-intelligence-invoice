@@ -809,4 +809,4 @@ with gr.Blocks() as interface:
             outputs=consultoria_output
         )
 
-    interface.launch(server_name="0.0.0.0", share=True)
+    interface.launch()
