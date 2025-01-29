@@ -4,40 +4,138 @@ import sqlite3
 import requests
 import json
 import os
+import shutil  # Para remover arquivos
+
 from langchain.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
 from langchain.schema.runnable import RunnableMap
-from dotenv import load_dotenv
-# Carregar variáveis do arquivo .env
-load_dotenv()
 
-# Acessar a chave da OpenAI
-openai_api_key = os.getenv("OPENAI_API_KEY")
-
-if not openai_api_key:
-    raise ValueError("A chave da OpenAI não foi encontrada no arquivo .env")
-
-# Configurar a variável de ambiente
-os.environ["OPENAI_API_KEY"] = openai_api_key
 # =============================================================================
-# BANCO DE DADOS
+# CONFIGURAÇÃO DA CHAVE OPENAI
+# =============================================================================
+os.environ['OPENAI_API_KEY'] = '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'
+
+
+# =============================================================================
+# CLASSE DE GERENCIAMENTO GLOBAL DE USUÁRIOS (users.db)
+# =============================================================================
+class UserManager:
+    """
+    Armazena apenas dados de login (username, password, data_criacao)
+    no arquivo 'users.db'.
+
+    Cada usuário possui seu próprio BD de notas e produtos, por exemplo:
+    'notas_fiscais_<username>.db'
+    """
+
+    def __init__(self, user_db="users.db"):
+        self.user_db = user_db
+        self._create_users_table()
+
+    def _connect(self):
+        return sqlite3.connect(self.user_db)
+
+    def _create_users_table(self):
+        conn = self._connect()
+        c = conn.cursor()
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                password TEXT NOT NULL,
+                date_created TEXT NOT NULL
+            )
+        """)
+        conn.commit()
+        conn.close()
+
+    def get_user_db_path(self, username):
+        """
+        Retorna o caminho do BD individual do usuário.
+        """
+        # Ex: 'notas_fiscais_<username>.db'
+        return f"notas_fiscais_{username}.db"
+
+    def register_user(self, username, password, common_password):
+        """
+        Cria um usuário no 'users.db', validando a senha comum.
+        Em seguida, cria o arquivo individual do usuário (notas_fiscais_<username>.db).
+        """
+        if common_password != "paralelo2025":
+            raise Exception("Senha comum incorreta. Registro não permitido.")
+
+        conn = self._connect()
+        c = conn.cursor()
+
+        # Verifica se usuário já existe
+        c.execute("SELECT id FROM users WHERE username = ?", (username,))
+        row = c.fetchone()
+        if row:
+            conn.close()
+            raise Exception("Este nome de usuário já está em uso. Escolha outro.")
+
+        data_criacao = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        c.execute("""
+            INSERT INTO users (username, password, date_created)
+            VALUES (?, ?, ?)
+        """, (username, password, data_criacao))
+        conn.commit()
+        conn.close()
+
+        # Cria o arquivo de BD do usuário e as tabelas (notas, produtos)
+        user_db_path = self.get_user_db_path(username)
+        NotaFiscalDB(user_db_path)  # apenas instanciar para criar as tabelas
+
+    def login_user(self, username, password):
+        """
+        Se login der certo, retorna True; senão False.
+        """
+        conn = self._connect()
+        c = conn.cursor()
+        c.execute("SELECT id FROM users WHERE username = ? AND password = ?", (username, password))
+        row = c.fetchone()
+        conn.close()
+        return True if row else False
+
+    def delete_user(self, username):
+        """
+        Remove o usuário do 'users.db' e deleta o arquivo individual de notas.
+        """
+        # 1) Apagar do users.db
+        conn = self._connect()
+        c = conn.cursor()
+        c.execute("DELETE FROM users WHERE username = ?", (username,))
+        conn.commit()
+        conn.close()
+
+        # 2) Remover arquivo .db do usuário
+        user_db_path = self.get_user_db_path(username)
+        if os.path.exists(user_db_path):
+            os.remove(user_db_path)
+
+
+# =============================================================================
+# CLASSE DE BANCO DE DADOS DE NOTAS (INDIVIDUAL POR USUÁRIO)
 # =============================================================================
 class NotaFiscalDB:
-    def __init__(self, db_name="notas_fiscais.db"):
-        self.db_name = db_name
-        self.criar_banco()
+    """
+    Cada instância representa o BD de um usuário específico, ex: 'notas_fiscais_<username>.db'.
+    Não há mais coluna de user_id, pois cada BD pertence a um único usuário.
+    """
 
-    def conectar(self):
-        return sqlite3.connect(self.db_name)
+    def __init__(self, db_path):
+        self.db_path = db_path
+        self._create_tables()
 
-    def criar_banco(self):
-        """
-        Cria as tabelas originais + estrutura para usuários (login).
-        """
-        conn = self.conectar()
+    def _connect(self):
+        return sqlite3.connect(self.db_path)
+
+    def _create_tables(self):
+        conn = self._connect()
         cursor = conn.cursor()
 
-        # Tabela original: notas
+        # Tabela de notas
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS notas (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -47,7 +145,7 @@ class NotaFiscalDB:
             )
         ''')
 
-        # Tabela original: produtos
+        # Tabela de produtos
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS produtos (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -62,175 +160,49 @@ class NotaFiscalDB:
             )
         ''')
 
-        # NOVO: Tabela de usuários
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                username TEXT UNIQUE NOT NULL,
-                password TEXT NOT NULL,
-                date_created TEXT NOT NULL
-            )
-        ''')
-
-        # NOVO: Adiciona user_id a notas e produtos (se não existir)
-        try:
-            cursor.execute("ALTER TABLE notas ADD COLUMN user_id INTEGER")
-        except:
-            pass
-
-        try:
-            cursor.execute("ALTER TABLE produtos ADD COLUMN user_id INTEGER")
-        except:
-            pass
-
-        # CHAVE IMPORTANTE: user_note_id (ID local da nota por usuário)
-        try:
-            cursor.execute("ALTER TABLE notas ADD COLUMN user_note_id INTEGER")
-        except:
-            pass
-
         conn.commit()
         conn.close()
 
-    # ----------------- MÉTODOS DE USUÁRIO -----------------
-    def register_user(self, username, password, common_password):
-        """
-        Registra um novo usuário, exigindo a senha comum 'paralelo2025'.
-        Retorna o ID do usuário criado.
-        """
-        if common_password != "paralelo2025":
-            raise Exception("Senha comum incorreta. Registro não permitido.")
-
-        conn = self.conectar()
+    # ----------------- MÉTODOS ORIGINAIS, SEM user_id -----------------
+    def listar_notas(self):
+        conn = self._connect()
         cursor = conn.cursor()
-
-        # Verifica se usuário já existe
-        cursor.execute("SELECT id FROM users WHERE username = ?", (username,))
-        row = cursor.fetchone()
-        if row:
-            conn.close()
-            raise Exception("Este nome de usuário já está em uso. Escolha outro.")
-
-        data_criacao = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        cursor.execute('''
-            INSERT INTO users (username, password, date_created)
-            VALUES (?, ?, ?)
-        ''', (username, password, data_criacao))
-        conn.commit()
-
-        new_id = cursor.lastrowid
-        conn.close()
-        return new_id
-
-    def login_user(self, username, password):
-        """
-        Se login der certo, retorna user_id; senão None.
-        """
-        conn = self.conectar()
-        cursor = conn.cursor()
-        cursor.execute("SELECT id FROM users WHERE username = ? AND password = ?", (username, password))
-        row = cursor.fetchone()
-        conn.close()
-        if row:
-            return row[0]  # user_id
-        else:
-            return None
-
-    def delete_user(self, user_id):
-        """
-        Remove o usuário e todas as notas/produtos dele.
-        """
-        conn = self.conectar()
-        cursor = conn.cursor()
-
-        # Apaga produtos e notas do user
-        cursor.execute("DELETE FROM produtos WHERE user_id = ?", (user_id,))
-        cursor.execute("DELETE FROM notas WHERE user_id = ?", (user_id,))
-
-        # Apaga o user
-        cursor.execute("DELETE FROM users WHERE id = ?", (user_id,))
-        conn.commit()
-        conn.close()
-
-    # ----------------- MÉTODOS ORIGINAIS (ADAPTADOS) --------------
-    def listar_notas(self, user_id=None):
-        """
-        Em vez de exibir o 'id' autoincrement do BD, exibimos 'user_note_id'.
-        """
-        conn = self.conectar()
-        cursor = conn.cursor()
-        if user_id is not None:
-            cursor.execute("SELECT user_note_id, cnpj, emissao FROM notas WHERE user_id = ?", (user_id,))
-        else:
-            # Modo antigo, sem user
-            cursor.execute("SELECT user_note_id, cnpj, emissao FROM notas")
+        cursor.execute("SELECT id, cnpj, emissao FROM notas")
         notas = cursor.fetchall()
         conn.close()
         return notas
 
-    def buscar_nota_por_id(self, user_note_id, user_id=None):
-        """
-        Agora a busca é feita por user_note_id (ID local do usuário), e não pelo 'id' global.
-        """
-        conn = self.conectar()
+    def buscar_nota_por_id(self, nota_id):
+        conn = self._connect()
         cursor = conn.cursor()
-        if user_id is not None:
-            cursor.execute("SELECT * FROM notas WHERE user_note_id = ? AND user_id = ?", (user_note_id, user_id))
-        else:
-            cursor.execute("SELECT * FROM notas WHERE user_note_id = ?", (user_note_id,))
+        cursor.execute("SELECT * FROM notas WHERE id = ?", (nota_id,))
         nota = cursor.fetchone()
         if nota:
             cnpj_emissao = f"{nota[1]}_{nota[2]}"
-            if user_id is not None:
-                cursor.execute("SELECT * FROM produtos WHERE cnpj_emissao = ? AND user_id = ?", (cnpj_emissao, user_id))
-            else:
-                cursor.execute("SELECT * FROM produtos WHERE cnpj_emissao = ?", (cnpj_emissao,))
+            cursor.execute("SELECT * FROM produtos WHERE cnpj_emissao = ?", (cnpj_emissao,))
             produtos = cursor.fetchall()
             conn.close()
             return nota, produtos
         conn.close()
         return None, []
 
-    def salvar_dados(self, cnpj, emissao, dados_nota, produtos, user_id=None):
-        """
-        Salva nota e produtos no BD. Gera 'user_note_id' incremental por usuário.
-        """
-        conn = self.conectar()
+    def salvar_dados(self, cnpj, emissao, dados_nota, produtos):
+        conn = self._connect()
         cursor = conn.cursor()
 
-        # Pegar o maior user_note_id já existente para este user_id e incrementar
-        if user_id is not None:
-            cursor.execute("""
-                SELECT COALESCE(MAX(user_note_id), 0)
-                FROM notas
-                WHERE user_id = ?
-            """, (user_id,))
-            max_note_for_user = cursor.fetchone()[0]
-            new_user_note_id = max_note_for_user + 1
-        else:
-            new_user_note_id = None  # Modo antigo: sem user
-
         cursor.execute('''
-            INSERT INTO notas (cnpj, emissao, dados_nota, user_id, user_note_id)
-            VALUES (?, ?, ?, ?, ?)
-        ''', (
-            cnpj,
-            emissao,
-            json.dumps(dados_nota, ensure_ascii=False),
-            user_id,
-            new_user_note_id
-        ))
+            INSERT INTO notas (cnpj, emissao, dados_nota)
+            VALUES (?, ?, ?)
+        ''', (cnpj, emissao, json.dumps(dados_nota, ensure_ascii=False)))
 
         cnpj_emissao = f"{cnpj}_{emissao}"
-        nota_pk_id = cursor.lastrowid  # PK global, se quiser
-
         for produto in produtos:
             cursor.execute('''
                 INSERT INTO produtos (
                     cnpj_emissao, produto_id, nome, categoria, quantidade, unidade,
-                    valor_unitario, valor_total, user_id
+                    valor_unitario, valor_total
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 cnpj_emissao,
                 produto.get("Id"),
@@ -239,147 +211,75 @@ class NotaFiscalDB:
                 produto.get("Traits", {}).get("Quantidade"),
                 produto.get("Traits", {}).get("Unidade"),
                 produto.get("Traits", {}).get("Valor Unitário"),
-                produto.get("Traits", {}).get("Valor Total"),
-                user_id
+                produto.get("Traits", {}).get("Valor Total")
             ))
         conn.commit()
         conn.close()
 
-    def calcular_financeiro(self, nota_ids=None, user_id=None):
-        """
-        'nota_ids' agora são user_note_ids, não o autoincrement global.
-        """
-        conn = self.conectar()
+    def calcular_financeiro(self, nota_ids=None):
+        conn = self._connect()
         cursor = conn.cursor()
 
-        if user_id:
-            if nota_ids:
-                placeholders = ",".join("?" for _ in nota_ids)
-                # Precisamos converter user_note_id -> cnpj_emissao
-                # via subselect:
-                cursor.execute(f"""
-                    SELECT categoria, SUM(CAST(valor_total AS REAL)) AS total_gasto
-                    FROM produtos
-                    WHERE user_id = ?
-                      AND cnpj_emissao IN (
-                        SELECT cnpj || '_' || emissao 
-                        FROM notas
-                        WHERE user_id = ?
-                          AND user_note_id IN ({placeholders})
-                      )
-                    GROUP BY categoria
-                """, [user_id, user_id, *nota_ids])
-                categorias = cursor.fetchall()
+        if nota_ids:
+            placeholders = ",".join("?" for _ in nota_ids)
+            # categorias
+            cursor.execute(f"""
+                SELECT categoria, SUM(CAST(valor_total AS REAL)) AS total_gasto
+                FROM produtos
+                WHERE cnpj_emissao IN (
+                    SELECT cnpj || '_' || emissao 
+                    FROM notas
+                    WHERE id IN ({placeholders})
+                )
+                GROUP BY categoria
+            """, nota_ids)
+            categorias = cursor.fetchall()
 
-                cursor.execute(f"""
-                    SELECT nome, CAST(valor_total AS REAL) AS total_valor
-                    FROM produtos
-                    WHERE user_id = ?
-                      AND cnpj_emissao IN (
-                        SELECT cnpj || '_' || emissao 
-                        FROM notas
-                        WHERE user_id = ?
-                          AND user_note_id IN ({placeholders})
-                      )
-                    ORDER BY total_valor DESC
-                    LIMIT 10
-                """, [user_id, user_id, *nota_ids])
-                itens_mais_caros = cursor.fetchall()
+            # top 10
+            cursor.execute(f"""
+                SELECT nome, CAST(valor_total AS REAL) AS total_valor
+                FROM produtos
+                WHERE cnpj_emissao IN (
+                    SELECT cnpj || '_' || emissao
+                    FROM notas
+                    WHERE id IN ({placeholders})
+                )
+                ORDER BY total_valor DESC
+                LIMIT 10
+            """, nota_ids)
+            itens_mais_caros = cursor.fetchall()
 
-                cursor.execute(f"""
-                    SELECT SUM(CAST(valor_total AS REAL))
-                    FROM produtos
-                    WHERE user_id = ?
-                      AND cnpj_emissao IN (
-                        SELECT cnpj || '_' || emissao 
-                        FROM notas
-                        WHERE user_id = ?
-                          AND user_note_id IN ({placeholders})
-                      )
-                """, [user_id, user_id, *nota_ids])
-                total_valor = cursor.fetchone()[0]
-            else:
-                # Todas do user
-                cursor.execute("""
-                    SELECT categoria, SUM(CAST(valor_total AS REAL)) AS total_gasto
-                    FROM produtos
-                    WHERE user_id = ?
-                    GROUP BY categoria
-                """, (user_id,))
-                categorias = cursor.fetchall()
+            # total
+            cursor.execute(f"""
+                SELECT SUM(CAST(valor_total AS REAL))
+                FROM produtos
+                WHERE cnpj_emissao IN (
+                    SELECT cnpj || '_' || emissao
+                    FROM notas
+                    WHERE id IN ({placeholders})
+                )
+            """, nota_ids)
+            total_valor = cursor.fetchone()[0]
 
-                cursor.execute("""
-                    SELECT nome, CAST(valor_total AS REAL) AS total_valor
-                    FROM produtos
-                    WHERE user_id = ?
-                    ORDER BY total_valor DESC
-                    LIMIT 10
-                """, (user_id,))
-                itens_mais_caros = cursor.fetchall()
-
-                cursor.execute("""
-                    SELECT SUM(CAST(valor_total AS REAL))
-                    FROM produtos
-                    WHERE user_id = ?
-                """, (user_id,))
-                total_valor = cursor.fetchone()[0]
         else:
-            # Modo antigo (sem user)
-            if nota_ids:
-                placeholders = ",".join("?" for _ in nota_ids)
-                cursor.execute(f"""
-                    SELECT categoria, SUM(CAST(valor_total AS REAL)) AS total_gasto
-                    FROM produtos
-                    WHERE cnpj_emissao IN (
-                        SELECT cnpj || '_' || emissao 
-                        FROM notas
-                        WHERE user_note_id IN ({placeholders})
-                    )
-                    GROUP BY categoria
-                """, nota_ids)
-                categorias = cursor.fetchall()
+            # Todas as notas
+            cursor.execute("""
+                SELECT categoria, SUM(CAST(valor_total AS REAL)) AS total_gasto
+                FROM produtos
+                GROUP BY categoria
+            """)
+            categorias = cursor.fetchall()
 
-                cursor.execute(f"""
-                    SELECT nome, CAST(valor_total AS REAL) AS total_valor
-                    FROM produtos
-                    WHERE cnpj_emissao IN (
-                        SELECT cnpj || '_' || emissao
-                        FROM notas
-                        WHERE user_note_id IN ({placeholders})
-                    )
-                    ORDER BY total_valor DESC
-                    LIMIT 10
-                """, nota_ids)
-                itens_mais_caros = cursor.fetchall()
+            cursor.execute("""
+                SELECT nome, CAST(valor_total AS REAL) AS total_valor
+                FROM produtos
+                ORDER BY total_valor DESC
+                LIMIT 10
+            """)
+            itens_mais_caros = cursor.fetchall()
 
-                cursor.execute(f"""
-                    SELECT SUM(CAST(valor_total AS REAL))
-                    FROM produtos
-                    WHERE cnpj_emissao IN (
-                        SELECT cnpj || '_' || emissao
-                        FROM notas
-                        WHERE user_note_id IN ({placeholders})
-                    )
-                """, nota_ids)
-                total_valor = cursor.fetchone()[0]
-            else:
-                cursor.execute("""
-                    SELECT categoria, SUM(CAST(valor_total AS REAL)) AS total_gasto
-                    FROM produtos
-                    GROUP BY categoria
-                """)
-                categorias = cursor.fetchall()
-
-                cursor.execute("""
-                    SELECT nome, CAST(valor_total AS REAL) AS total_valor
-                    FROM produtos
-                    ORDER BY total_valor DESC
-                    LIMIT 10
-                """)
-                itens_mais_caros = cursor.fetchall()
-
-                cursor.execute("SELECT SUM(CAST(valor_total AS REAL)) FROM produtos")
-                total_valor = cursor.fetchone()[0]
+            cursor.execute("SELECT SUM(CAST(valor_total AS REAL)) FROM produtos")
+            total_valor = cursor.fetchone()[0]
 
         conn.close()
         return {
@@ -390,7 +290,7 @@ class NotaFiscalDB:
 
 
 # =============================================================================
-# FUNÇÕES AUXILIARES
+# FUNÇÕES AUXILIARES DE EXTRAÇÃO (LangChain)
 # =============================================================================
 def fetch_webpage(url):
     try:
@@ -404,8 +304,6 @@ def fetch_webpage(url):
 
 def process_html_with_langchain(html_content):
     prompt = ChatPromptTemplate.from_template("""
-        IMPORTANTE: não escreva nada além do JSON.
-
         Você é um modelo que analisa notas fiscais. Extraia as seguintes informações gerais da nota:
         - CNPJ do Emitente
         - Número
@@ -436,6 +334,7 @@ def process_html_with_langchain(html_content):
                 }}
             ]
         }}
+        Certifique-se de que o JSON esteja bem formatado e sem erros.
 
         HTML da Nota Fiscal:
         {html_content}
@@ -444,13 +343,7 @@ def process_html_with_langchain(html_content):
     runnable = RunnableMap({"entities": prompt | llm})
     try:
         result = runnable.invoke({"html_content": html_content})
-        resposta = result["entities"].content.strip()
-
-        # Checagem simples se começa com { ou [
-        if not (resposta.startswith("{") or resposta.startswith("[")):
-            raise Exception(f"Retorno do LLM não parece JSON:\n{resposta[:200]}")
-
-        return resposta
+        return result["entities"].content.strip()
     except Exception as e:
         raise Exception(f"Erro ao processar o HTML com o modelo: {e}")
 
@@ -470,56 +363,63 @@ def filtrar_dados(resultado):
 
 
 # =============================================================================
-# FUNÇÕES DO SISTEMA (LOGIN, REGISTRO, ETC.)
+# FUNÇÕES PARA A LÓGICA DO SISTEMA
 # =============================================================================
+# Instância global do gerenciador de usuários
+user_manager = UserManager()
+
+
 def registrar_conta(username, password, common_password, state):
-    db = NotaFiscalDB()
     try:
-        new_user_id = db.register_user(username, password, common_password)
+        user_manager.register_user(username, password, common_password)
         state["logged_in"] = True
-        state["user_id"] = new_user_id
         state["username"] = username
         return f"Conta criada! Usuário: {username}"
     except Exception as e:
         return f"Erro ao registrar: {str(e)}"
 
+
 def login_conta(username, password, state):
-    db = NotaFiscalDB()
-    user_id = db.login_user(username, password)
-    if user_id:
+    ok = user_manager.login_user(username, password)
+    if ok:
         state["logged_in"] = True
-        state["user_id"] = user_id
         state["username"] = username
         return f"Login bem-sucedido! Usuário: {username}"
     else:
         return "Login inválido. Verifique usuário e senha."
+
 
 def logout_conta(state):
     if not state["logged_in"]:
         return "Você já está deslogado."
     name = state.get("username", "")
     state["logged_in"] = False
-    state["user_id"] = None
     state["username"] = ""
     return f"Logout efetuado. Até mais, {name}!"
+
 
 def excluir_conta(state):
     if not state["logged_in"]:
         return "Você não está logado."
-    db = NotaFiscalDB()
-    user_id = state["user_id"]
     name = state["username"]
-    db.delete_user(user_id)
-
+    user_manager.delete_user(name)
     state["logged_in"] = False
-    state["user_id"] = None
     state["username"] = ""
     return f"Conta de {name} excluída com sucesso!"
 
 
 # =============================================================================
-# FUNÇÕES DE NOTAS
+# FUNÇÕES RELACIONADAS AO BD DE CADA USUÁRIO
 # =============================================================================
+def get_user_db(state):
+    """
+    Devolve uma instância NotaFiscalDB com base no username logado.
+    """
+    username = state["username"]
+    db_path = user_manager.get_user_db_path(username)
+    return NotaFiscalDB(db_path)
+
+
 def adicionar_nota(url, state):
     if not state["logged_in"]:
         return "Você não está logado. Faça login para adicionar notas."
@@ -528,33 +428,26 @@ def adicionar_nota(url, state):
         html_content = fetch_webpage(url)
         resultado = process_html_with_langchain(html_content)
         dados_filtrados = filtrar_dados(resultado)
-        db = NotaFiscalDB()
+
+        db = get_user_db(state)
         db.salvar_dados(
             dados_filtrados["CNPJ"],
             dados_filtrados["Emissao"],
             dados_filtrados["Dados Nota"],
-            dados_filtrados["Produtos"],
-            user_id=state["user_id"]  # vinculado ao dono
+            dados_filtrados["Produtos"]
         )
         return "Nota adicionada com sucesso!"
     except Exception as e:
         return f"Erro ao adicionar a nota: {e}"
 
+
 def buscar_detalhes_por_id(nota_id, state):
-    """
-    nota_id agora significa user_note_id (ID local).
-    """
     if not state["logged_in"]:
         return "Você não está logado."
-    db = NotaFiscalDB()
-    nota, produtos = db.buscar_nota_por_id(nota_id, user_id=state["user_id"])
+    db = get_user_db(state)
+    nota, produtos = db.buscar_nota_por_id(nota_id)
     if nota:
-        # Lembre: nota[0] = 'id'(pk), nota[1] = cnpj, nota[2] = emissao, nota[3] = dados_nota,
-        #         nota[4] = user_id, nota[5] = user_note_id
-        detalhes = (
-            f"Nota Fiscal:\n"
-            f"ID: {nota[5]}, CNPJ: {nota[1]}, Emissão: {nota[2]}\n\nProdutos:\n"
-        )
+        detalhes = f"Nota Fiscal:\nID: {nota[0]}, CNPJ: {nota[1]}, Emissão: {nota[2]}\n\nProdutos:\n"
         for p in produtos:
             detalhes += (
                 f"  - Nome: {p[3]}, Categoria: {p[4]}, "
@@ -563,34 +456,33 @@ def buscar_detalhes_por_id(nota_id, state):
             )
         return detalhes
     else:
-        return "Nota não encontrada ou não pertence a você."
+        return "Nota não encontrada."
+
 
 def listar_notas(state):
     if not state["logged_in"]:
         return "Você não está logado."
-    db = NotaFiscalDB()
-    rows = db.listar_notas(user_id=state["user_id"])
+    db = get_user_db(state)
+    rows = db.listar_notas()
     if not rows:
         return "Nenhuma nota cadastrada."
-    # rows => [(user_note_id, cnpj, emissao), ...]
     return "\n".join([
         f"ID: {r[0]}, CNPJ: {r[1]}, Emissão: {r[2]}" for r in rows
     ])
 
+
 def calcular_financeiro_interface(notas_selecionadas, state):
-    """
-    'notas_selecionadas' são os user_note_ids que o usuário digitou.
-    """
     if not state["logged_in"]:
         return "Você não está logado."
-    db = NotaFiscalDB()
+
+    db = get_user_db(state)
 
     if notas_selecionadas.strip():
         ids = [int(x.strip()) for x in notas_selecionadas.split(",") if x.strip().isdigit()]
     else:
         ids = None
 
-    result = db.calcular_financeiro(ids, user_id=state["user_id"])
+    result = db.calcular_financeiro(ids)
     cat_txt = "\n".join([f"{c[0]}: R$ {c[1]:.2f}" for c in result["categorias"]])
     caros_txt = "\n".join([f"{i[0]}: R$ {i[1]:.2f}" for i in result["itens_mais_caros"]])
     total_txt = f"R$ {result['total_valor']:.2f}"
@@ -600,21 +492,22 @@ def calcular_financeiro_interface(notas_selecionadas, state):
         f"Valor total: {total_txt}"
     )
 
+
 def gerar_consultoria(state):
     if not state["logged_in"]:
         return "Você não está logado."
-    db = NotaFiscalDB()
-    conn = db.conectar()
+
+    db = get_user_db(state)
+    conn = db._connect()
     cursor = conn.cursor()
 
     cursor.execute("""
         SELECT nome, cnpj_emissao, valor_unitario
         FROM produtos
-        WHERE user_id = ?
-          AND nome != ''
+        WHERE nome != ''
           AND valor_unitario != ''
         ORDER BY nome
-    """, (state["user_id"],))
+    """)
     rows = cursor.fetchall()
     conn.close()
 
@@ -654,9 +547,9 @@ def gerar_consultoria(state):
 # =============================================================================
 with gr.Blocks() as interface:
     # Armazena se o usuário está logado, etc.
-    state = gr.State({"logged_in": False, "user_id": None, "username": ""})
+    state = gr.State({"logged_in": False, "username": ""})
 
-    gr.Markdown("## Eagle 0.1")
+    gr.Markdown("## Eagle 0.1 - Bancos de Dados Separados por Usuário")
 
     # Mostra no topo o nome do usuário logado
     def label_usuario(st):
@@ -765,12 +658,11 @@ with gr.Blocks() as interface:
 
     # -- ABA BUSCAR NOTA POR ID --
     with gr.Tab("Buscar Nota por ID"):
-        nota_id_input = gr.Textbox(label="ID da Nota Fiscal (Local)")
+        nota_id_input = gr.Textbox(label="ID da Nota Fiscal")
         buscar_id_btn = gr.Button("Buscar")
         nota_id_output = gr.Textbox(label="Detalhes da Nota Fiscal")
 
         def acao_buscar(nid, st):
-            # lembre-se: aqui 'nid' é user_note_id
             return buscar_detalhes_por_id(nid, st)
 
         buscar_id_btn.click(
@@ -781,7 +673,7 @@ with gr.Blocks() as interface:
 
     # -- ABA ÁREA FINANCEIRA --
     with gr.Tab("Área Financeira"):
-        notas_selecionadas = gr.Textbox(label="IDs das Notas (ex: 1,2) ou vazio p/ todas (local)")
+        notas_selecionadas = gr.Textbox(label="IDs das Notas (ex: 1,2) ou vazio p/ todas")
         calcular_btn = gr.Button("Calcular")
         financeiro_output = gr.Textbox(label="Resultados Financeiros")
 
