@@ -13,7 +13,7 @@ from langchain.schema.runnable import RunnableMap
 # =============================================================================
 # CONFIGURAÇÃO DA CHAVE OPENAI
 # =============================================================================
-os.environ['OPENAI_API_KEY'] = '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'
+os.environ['OPENAI_API_KEY'] = 's'
 
 
 # =============================================================================
